@@ -14,10 +14,6 @@ st.set_page_config(layout="wide")
 def generate_features(df):
     df = df.copy()
 
-    if "value" not in df.columns:
-        st.error("CSV must contain 'value' column")
-        st.stop()
-
     df["lag_1"] = df["value"].shift(1)
     df["lag_2"] = df["value"].shift(2)
     df["rolling_mean"] = df["value"].rolling(5).mean()
@@ -28,7 +24,7 @@ def generate_features(df):
     return df
 
 # -------------------------
-# TRAIN MODEL
+# MODEL TRAINING
 # -------------------------
 def train_model(df, features):
     scaler = StandardScaler()
@@ -45,27 +41,24 @@ def train_model(df, features):
     return model, scaler
 
 # -------------------------
-# SCORING
+# SCORE
 # -------------------------
 def compute_score(model, scaler, df_row, features):
     X = scaler.transform(df_row[features])
     return model.decision_function(X)[0]
 
-def get_ensemble_scores(model, scaler, df_row, features, n=10):
-    scores = []
+# -------------------------
+# CONDITIONAL COUNTERFACTUAL (NEW)
+# -------------------------
+def apply_structural_update(df, idx, new_value):
+    temp_df = df.copy()
 
-    for _ in range(n):
-        noise = np.random.normal(0, 0.2, size=len(features))
-        temp = df_row.copy()
-        temp[features] += noise
+    temp_df.loc[idx, "value"] = new_value
 
-        score = compute_score(model, scaler, temp, features)
-        scores.append(score)
+    # update dependent features
+    temp_df = generate_features(temp_df)
 
-    return np.array(scores)
-
-def compute_confidence(std):
-    return 1 / (1 + std)
+    return temp_df.loc[[idx]]
 
 # -------------------------
 # UI
@@ -77,8 +70,6 @@ uploaded = st.file_uploader("Upload CSV")
 if uploaded:
     df = pd.read_csv(uploaded)
 else:
-    st.info("Using sample synthetic data")
-
     n = 500
     t = np.arange(n)
 
@@ -90,7 +81,7 @@ else:
     df = pd.DataFrame({"value": val})
 
 # -------------------------
-# PROCESS DATA
+# PROCESS
 # -------------------------
 df = generate_features(df)
 
@@ -100,7 +91,10 @@ model, scaler = train_model(df, features)
 
 X = scaler.transform(df[features])
 df["score"] = model.decision_function(X)
-df["pred"] = (df["score"] > 0).astype(int)
+
+# ✅ CORRECT THRESHOLD
+threshold = np.percentile(df["score"], 10)
+df["pred"] = (df["score"] < threshold).astype(int)
 
 anomaly_indices = df[df["pred"] == 1].index.tolist()
 
@@ -111,7 +105,7 @@ tabs = st.tabs([
     "Overview",
     "Trends",
     "Detection",
-    "Explanation",
+    "Causal Explanation",
     "Feature Impact",
     "Confidence",
     "Simulator"
@@ -121,10 +115,10 @@ tabs = st.tabs([
 # OVERVIEW
 # =========================
 with tabs[0]:
-    st.subheader("Dataset Overview")
+    st.subheader("Overview")
 
     col1, col2 = st.columns(2)
-    col1.metric("Total Rows", len(df))
+    col1.metric("Rows", len(df))
     col2.metric("Anomalies", df["pred"].sum())
 
     st.dataframe(df.head(20))
@@ -133,8 +127,6 @@ with tabs[0]:
 # TRENDS
 # =========================
 with tabs[1]:
-    st.subheader("Trend")
-
     fig, ax = plt.subplots(figsize=(8,3))
     ax.plot(df["value"])
     st.pyplot(fig)
@@ -143,18 +135,17 @@ with tabs[1]:
 # DETECTION
 # =========================
 with tabs[2]:
-    st.subheader("Anomaly Detection")
-
     fig, ax = plt.subplots(figsize=(8,3))
     ax.plot(df["value"])
 
     anomalies = df[df["pred"] == 1]
-    ax.scatter(anomalies.index, anomalies["value"])
+
+    ax.scatter(anomalies.index, anomalies["value"], color="red", s=30)
 
     st.pyplot(fig)
 
 # =========================
-# EXPLANATION
+# CAUSAL EXPLANATION
 # =========================
 with tabs[3]:
     st.subheader("Causal Explanation")
@@ -162,50 +153,50 @@ with tabs[3]:
     if anomaly_indices:
         idx = st.selectbox("Select anomaly", anomaly_indices)
 
-        point = df.loc[[idx]]
-        baseline = compute_score(model, scaler, point, features)
+        original = df.loc[[idx]]
+        baseline = compute_score(model, scaler, original, features)
 
-        impacts = []
+        results = []
 
-        for f in features:
-            temp = point.copy()
-            temp[f] = df[f].median()
+        for f in ["value"]:  # focus on core driver
 
-            new_score = compute_score(model, scaler, temp, features)
+            median_val = df[f].median()
 
-            impacts.append({
+            cf_point = apply_structural_update(df, idx, median_val)
+
+            new_score = compute_score(model, scaler, cf_point, features)
+
+            results.append({
                 "feature": f,
-                "impact": baseline - new_score
+                "impact": baseline - new_score,
+                "new_score": new_score
             })
 
-        cf_df = pd.DataFrame(impacts).sort_values("impact", ascending=False)
+        cf_df = pd.DataFrame(results).sort_values("impact", ascending=False)
 
         top = cf_df.iloc[0]
 
-        st.write("Root Cause:", top["feature"])
-        st.write("Fix: Adjust feature to normal range")
+        st.write(f"Root Cause: {top['feature']}")
+        st.write(f"If {top['feature']} moves toward normal, anomaly reduces")
 
 # =========================
 # FEATURE IMPACT
 # =========================
 with tabs[4]:
-    st.subheader("Feature Impact")
-
     if anomaly_indices:
         idx = anomaly_indices[0]
-        point = df.loc[[idx]]
 
         impacts = []
 
         for f in features:
-            temp = point.copy()
+            temp = df.loc[[idx]].copy()
             temp[f] = df[f].median()
 
             new_score = compute_score(model, scaler, temp, features)
 
             impacts.append({
                 "feature": f,
-                "impact": compute_score(model, scaler, point, features) - new_score
+                "impact": compute_score(model, scaler, df.loc[[idx]], features) - new_score
             })
 
         cf_df = pd.DataFrame(impacts)
@@ -218,16 +209,23 @@ with tabs[4]:
 # CONFIDENCE
 # =========================
 with tabs[5]:
-    st.subheader("Model Confidence")
-
     if anomaly_indices:
         idx = anomaly_indices[0]
         point = df.loc[[idx]]
 
-        scores = get_ensemble_scores(model, scaler, point, features)
+        scores = []
+
+        for _ in range(10):
+            noise = np.random.normal(0, 0.2, len(features))
+            temp = point.copy()
+            temp[features] += noise
+
+            scores.append(compute_score(model, scaler, temp, features))
+
+        scores = np.array(scores)
 
         std = scores.std()
-        confidence = compute_confidence(std)
+        confidence = 1 / (1 + std)
 
         col1, col2 = st.columns(2)
 
@@ -240,24 +238,30 @@ with tabs[5]:
             st.metric("Confidence", f"{round(confidence*100,2)}%")
 
 # =========================
-# SIMULATOR
+# SIMULATOR (FIXED)
 # =========================
 with tabs[6]:
     st.subheader("What-if Simulator")
 
     if anomaly_indices:
         idx = anomaly_indices[0]
-        point = df.loc[[idx]].copy()
 
-        for f in features:
-            val = float(point[f])
-            point[f] = st.slider(f, val-20, val+20, val)
+        val = float(df.loc[idx, "value"])
 
-        new_score = compute_score(model, scaler, point, features)
+        new_val = st.slider(
+            "value",
+            float(df["value"].min()),
+            float(df["value"].max()),
+            val
+        )
+
+        cf_point = apply_structural_update(df, idx, new_val)
+
+        new_score = compute_score(model, scaler, cf_point, features)
 
         st.metric("New Score", round(new_score,4))
 
-        if new_score < 0:
-            st.success("Anomaly reduced")
-        else:
+        if new_score < threshold:
             st.error("Still anomalous")
+        else:
+            st.success("Anomaly reduced")
