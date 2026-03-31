@@ -2,49 +2,73 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import pickle
-import json
+
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
 
 st.set_page_config(layout="wide")
 
 # -------------------------
-# LOAD MODEL FILES
+# FEATURE ENGINEERING
 # -------------------------
-model = pickle.load(open("model.pkl", "rb"))
-scaler = pickle.load(open("scaler.pkl", "rb"))
-features = json.load(open("features.json"))
+def generate_features(df):
+    df = df.copy()
+
+    if "value" not in df.columns:
+        st.error("CSV must contain 'value' column")
+        st.stop()
+
+    df["lag_1"] = df["value"].shift(1)
+    df["lag_2"] = df["value"].shift(2)
+    df["rolling_mean"] = df["value"].rolling(5).mean()
+    df["rolling_std"] = df["value"].rolling(5).std()
+
+    df = df.fillna(method="bfill")
+
+    return df
 
 # -------------------------
-# HELPER FUNCTIONS
+# TRAIN MODEL
 # -------------------------
-def compute_score(df_row):
+def train_model(df, features):
+    scaler = StandardScaler()
+    X = scaler.fit_transform(df[features])
+
+    model = IsolationForest(
+        n_estimators=100,
+        contamination=0.1,
+        random_state=42
+    )
+
+    model.fit(X)
+
+    return model, scaler
+
+# -------------------------
+# SCORING
+# -------------------------
+def compute_score(model, scaler, df_row, features):
     X = scaler.transform(df_row[features])
     return model.decision_function(X)[0]
 
-def get_ensemble_scores(df_row, n=10):
+def get_ensemble_scores(model, scaler, df_row, features, n=10):
     scores = []
+
     for _ in range(n):
         noise = np.random.normal(0, 0.2, size=len(features))
         temp = df_row.copy()
         temp[features] += noise
-        score = compute_score(temp)
+
+        score = compute_score(model, scaler, temp, features)
         scores.append(score)
+
     return np.array(scores)
 
 def compute_confidence(std):
     return 1 / (1 + std)
 
-def generate_features(df):
-    if "lag_1" not in df.columns:
-        df["lag_1"] = df["value"].shift(1)
-        df["lag_2"] = df["value"].shift(2)
-        df["rolling_mean"] = df["value"].rolling(5).mean()
-        df["rolling_std"] = df["value"].rolling(5).std()
-        df = df.fillna(method="bfill")
-    return df
-
 # -------------------------
-# UI HEADER
+# UI
 # -------------------------
 st.title("CAUSAL-XAD Dashboard")
 
@@ -53,16 +77,32 @@ uploaded = st.file_uploader("Upload CSV")
 if uploaded:
     df = pd.read_csv(uploaded)
 else:
-    df = pd.read_csv("data.csv")
+    st.info("Using sample synthetic data")
 
+    n = 500
+    t = np.arange(n)
+
+    val = 50 + 10*np.sin(t/10) + np.random.normal(0,2,n)
+    val[100] += 40
+    val[200] -= 30
+    val[300:350] += np.linspace(0,30,50)
+
+    df = pd.DataFrame({"value": val})
+
+# -------------------------
+# PROCESS DATA
+# -------------------------
 df = generate_features(df)
 
-# -------------------------
-# MODEL PREDICTION
-# -------------------------
+features = ["value", "lag_1", "lag_2", "rolling_mean", "rolling_std"]
+
+model, scaler = train_model(df, features)
+
 X = scaler.transform(df[features])
 df["score"] = model.decision_function(X)
 df["pred"] = (df["score"] > 0).astype(int)
+
+anomaly_indices = df[df["pred"] == 1].index.tolist()
 
 # -------------------------
 # TABS
@@ -78,68 +118,60 @@ tabs = st.tabs([
 ])
 
 # =========================
-# TAB 1: OVERVIEW
+# OVERVIEW
 # =========================
 with tabs[0]:
     st.subheader("Dataset Overview")
 
     col1, col2 = st.columns(2)
-
     col1.metric("Total Rows", len(df))
     col2.metric("Anomalies", df["pred"].sum())
 
     st.dataframe(df.head(20))
 
 # =========================
-# TAB 2: TRENDS
+# TRENDS
 # =========================
 with tabs[1]:
-    st.subheader("Time Series Trend")
+    st.subheader("Trend")
 
     fig, ax = plt.subplots(figsize=(8,3))
     ax.plot(df["value"])
-    ax.set_title("Value over Time")
     st.pyplot(fig)
 
-    st.info("Shows overall behavior of the signal. Look for sudden jumps or gradual shifts.")
-
 # =========================
-# TAB 3: DETECTION
+# DETECTION
 # =========================
 with tabs[2]:
-    st.subheader("Detected Anomalies")
+    st.subheader("Anomaly Detection")
 
     fig, ax = plt.subplots(figsize=(8,3))
-    ax.plot(df["value"], label="Value")
+    ax.plot(df["value"])
 
     anomalies = df[df["pred"] == 1]
     ax.scatter(anomalies.index, anomalies["value"])
 
-    ax.legend()
     st.pyplot(fig)
 
-    st.info("Points marked are detected anomalies.")
-
 # =========================
-# TAB 4: EXPLANATION
+# EXPLANATION
 # =========================
 with tabs[3]:
     st.subheader("Causal Explanation")
 
-    anomaly_indices = df[df["pred"] == 1].index.tolist()
-
     if anomaly_indices:
-        idx = st.selectbox("Select anomaly index", anomaly_indices)
+        idx = st.selectbox("Select anomaly", anomaly_indices)
 
-        point = df.loc[[idx]].copy()
-        baseline = compute_score(point)
+        point = df.loc[[idx]]
+        baseline = compute_score(model, scaler, point, features)
 
         impacts = []
 
         for f in features:
             temp = point.copy()
             temp[f] = df[f].median()
-            new_score = compute_score(temp)
+
+            new_score = compute_score(model, scaler, temp, features)
 
             impacts.append({
                 "feature": f,
@@ -150,13 +182,11 @@ with tabs[3]:
 
         top = cf_df.iloc[0]
 
-        st.write("Anomaly Type: Detected")
-        st.write(f"Root Cause: {top['feature']}")
-
-        st.write(f"Suggested Fix: Adjust {top['feature']} to normal range")
+        st.write("Root Cause:", top["feature"])
+        st.write("Fix: Adjust feature to normal range")
 
 # =========================
-# TAB 5: FEATURE IMPACT
+# FEATURE IMPACT
 # =========================
 with tabs[4]:
     st.subheader("Feature Impact")
@@ -170,11 +200,12 @@ with tabs[4]:
         for f in features:
             temp = point.copy()
             temp[f] = df[f].median()
-            new_score = compute_score(temp)
+
+            new_score = compute_score(model, scaler, temp, features)
 
             impacts.append({
                 "feature": f,
-                "impact": compute_score(point) - new_score
+                "impact": compute_score(model, scaler, point, features) - new_score
             })
 
         cf_df = pd.DataFrame(impacts)
@@ -183,10 +214,8 @@ with tabs[4]:
         ax.bar(cf_df["feature"], cf_df["impact"])
         st.pyplot(fig)
 
-        st.info("Higher impact means stronger contribution to anomaly.")
-
 # =========================
-# TAB 6: CONFIDENCE
+# CONFIDENCE
 # =========================
 with tabs[5]:
     st.subheader("Model Confidence")
@@ -195,7 +224,7 @@ with tabs[5]:
         idx = anomaly_indices[0]
         point = df.loc[[idx]]
 
-        scores = get_ensemble_scores(point)
+        scores = get_ensemble_scores(model, scaler, point, features)
 
         std = scores.std()
         confidence = compute_confidence(std)
@@ -208,33 +237,23 @@ with tabs[5]:
             st.pyplot(fig)
 
         with col2:
-            st.metric("Uncertainty (std)", round(std,4))
             st.metric("Confidence", f"{round(confidence*100,2)}%")
 
-            if confidence > 0.85:
-                st.success("High confidence")
-            elif confidence > 0.6:
-                st.warning("Moderate confidence")
-            else:
-                st.error("Low confidence")
-
 # =========================
-# TAB 7: SIMULATOR (NEW)
+# SIMULATOR
 # =========================
 with tabs[6]:
-    st.subheader("What-If Simulator")
+    st.subheader("What-if Simulator")
 
     if anomaly_indices:
         idx = anomaly_indices[0]
         point = df.loc[[idx]].copy()
 
-        st.write("Adjust feature values:")
-
         for f in features:
             val = float(point[f])
             point[f] = st.slider(f, val-20, val+20, val)
 
-        new_score = compute_score(point)
+        new_score = compute_score(model, scaler, point, features)
 
         st.metric("New Score", round(new_score,4))
 
