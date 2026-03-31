@@ -1,0 +1,1 @@
+{'score': np.float64(0.011362988878926505), 'prediction': 1, 'type': 'drift', 'confidence': np.float64(0.9905229782441113), 'explanation': "\n    Anomaly Type: DRIFT\n\n    Root Cause:\n     The anomaly is primarily driven by 'value'.\n\n    Actionable Fix:\n     Adjust 'value' from 39.8 \n     to 63.22 to reduce anomaly risk.\n\n    Confidence: 99.05%\n      "}
