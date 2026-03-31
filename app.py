@@ -2,48 +2,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import pickle
-import json
-import os
+
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 
 st.set_page_config(layout="wide")
-
-# =========================
-# SAFE LOADING OR FALLBACK
-# =========================
-
-def load_or_train():
-    try:
-        with open("model.pkl", "rb") as f:
-            model = pickle.load(f)
-        with open("scaler.pkl", "rb") as f:
-            scaler = pickle.load(f)
-
-        st.success("Loaded trained model")
-
-    except Exception as e:
-        st.warning("Model load failed → using fallback model")
-
-        scaler = StandardScaler()
-        model = IsolationForest()
-
-        return model, scaler, False
-
-    return model, scaler, True
-
-model, scaler, is_loaded = load_or_train()
-
-# =========================
-# FEATURES
-# =========================
-
-if os.path.exists("features.json"):
-    with open("features.json") as f:
-        feature_cols = json.load(f)
-else:
-    feature_cols = ["value", "lag_1", "lag_2", "rolling_mean", "rolling_std"]
 
 # =========================
 # TITLE
@@ -58,9 +21,18 @@ st.title("CAUSAL-XAD Dashboard")
 uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 
 if uploaded_file is None:
+    st.info("Upload a CSV file to begin")
     st.stop()
 
 df = pd.read_csv(uploaded_file)
+
+# =========================
+# BASIC VALIDATION
+# =========================
+
+if "value" not in df.columns:
+    st.error("CSV must contain 'value' column")
+    st.stop()
 
 # =========================
 # FEATURE ENGINEERING
@@ -70,19 +42,20 @@ df["lag_1"] = df["value"].shift(1)
 df["lag_2"] = df["value"].shift(2)
 df["rolling_mean"] = df["value"].rolling(5).mean()
 df["rolling_std"] = df["value"].rolling(5).std()
+
 df = df.bfill()
 
+feature_cols = ["value", "lag_1", "lag_2", "rolling_mean", "rolling_std"]
+
 # =========================
-# TRAIN IF FALLBACK
+# MODEL (DYNAMIC)
 # =========================
 
-X = df[feature_cols]
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(df[feature_cols])
 
-if not is_loaded:
-    X_scaled = scaler.fit_transform(X)
-    model.fit(X_scaled)
-else:
-    X_scaled = scaler.transform(X)
+model = IsolationForest(n_estimators=100, contamination=0.1, random_state=42)
+model.fit(X_scaled)
 
 # =========================
 # PREDICTION
@@ -131,7 +104,7 @@ tabs = st.tabs([
 ])
 
 # =========================
-# OVERVIEW
+# TAB 1: OVERVIEW
 # =========================
 
 with tabs[0]:
@@ -144,18 +117,18 @@ with tabs[0]:
     col2.metric("Anomalies", int(df["pred"].sum()))
 
 # =========================
-# TREND
+# TAB 2: TREND
 # =========================
 
 with tabs[1]:
-    st.caption("Overall signal pattern")
+    st.caption("Overall time-series pattern")
 
     fig, ax = plt.subplots(figsize=(7,3))
     ax.plot(df["value"])
     st.pyplot(fig)
 
 # =========================
-# DETECTION
+# TAB 3: DETECTION
 # =========================
 
 with tabs[2]:
@@ -170,11 +143,11 @@ with tabs[2]:
     st.pyplot(fig)
 
 # =========================
-# TYPES
+# TAB 4: TYPES
 # =========================
 
 with tabs[3]:
-    st.caption("Spike vs Drift classification")
+    st.caption("Spike vs drift classification")
 
     fig, ax = plt.subplots(figsize=(7,3))
     ax.plot(df["value"])
@@ -187,13 +160,13 @@ with tabs[3]:
     st.pyplot(fig)
 
 # =========================
-# EXPLANATION
+# TAB 5: EXPLANATION
 # =========================
 
 with tabs[4]:
-    st.caption("Top contributing feature")
+    st.caption("Most deviating feature (proxy explanation)")
 
-    idx = st.number_input("Index", 0, len(df)-1, 0)
+    idx = st.number_input("Select index", 0, len(df)-1, 0)
 
     row = df.loc[idx]
 
@@ -204,17 +177,17 @@ with tabs[4]:
 
     top_feature = max(contributions, key=contributions.get)
 
-    st.write("Type:", row["anomaly_type"])
-    st.write("Driver:", top_feature)
+    st.write("Anomaly Type:", row["anomaly_type"])
+    st.write("Main Driver:", top_feature)
 
 # =========================
-# IMPACT
+# TAB 6: IMPACT
 # =========================
 
 with tabs[5]:
     st.caption("Feature deviation magnitude")
 
-    idx = st.number_input("Index ", 0, len(df)-1, 0)
+    idx = st.number_input("Index", 0, len(df)-1, 0, key="impact")
 
     row = df.loc[idx]
 
@@ -227,26 +200,27 @@ with tabs[5]:
     st.pyplot(fig)
 
 # =========================
-# CONFIDENCE
+# TAB 7: CONFIDENCE
 # =========================
 
 with tabs[6]:
-    st.caption("Model uncertainty estimate")
+    st.caption("Model uncertainty (lower variance = higher confidence)")
 
     st.metric("Confidence", f"{confidence*100:.2f}%")
 
     fig, ax = plt.subplots(figsize=(7,3))
     ax.hist(df["score"], bins=20)
+
     st.pyplot(fig)
 
 # =========================
-# SIMULATOR
+# TAB 8: SIMULATOR
 # =========================
 
 with tabs[7]:
-    st.caption("Modify values and test outcome")
+    st.caption("Modify inputs and observe score change")
 
-    idx = st.number_input("Index  ", 0, len(df)-1, 0)
+    idx = st.number_input("Index ", 0, len(df)-1, 0)
 
     test_point = df.loc[[idx]].copy()
 
@@ -261,9 +235,9 @@ with tabs[7]:
     scaled = scaler.transform(test_point[feature_cols])
     new_score = model.decision_function(scaled)[0]
 
-    st.metric("Score", round(new_score, 4))
+    st.metric("New Score", round(new_score, 4))
 
     if new_score > 0:
         st.success("Normal")
     else:
-        st.error("Anomaly")
+        st.error("Anomalous")
