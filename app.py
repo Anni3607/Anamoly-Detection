@@ -1,131 +1,113 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import joblib
-import json
 import matplotlib.pyplot as plt
+import pickle
+import json
+
+st.set_page_config(layout="wide")
 
 # -------------------------
-# CONFIG
+# LOAD MODEL FILES
 # -------------------------
-st.set_page_config(page_title="CAUSAL-XAD", layout="wide")
+model = pickle.load(open("model.pkl", "rb"))
+scaler = pickle.load(open("scaler.pkl", "rb"))
+features = json.load(open("features.json"))
 
 # -------------------------
-# LOAD FILES
+# HELPER FUNCTIONS
 # -------------------------
-model = joblib.load("model.pkl")
-scaler = joblib.load("scaler.pkl")
+def compute_score(df_row):
+    X = scaler.transform(df_row[features])
+    return model.decision_function(X)[0]
 
-with open("features.json") as f:
-    features = json.load(f)
-
-# -------------------------
-# FUNCTIONS
-# -------------------------
-
-def compute_score(input_df):
-    X = scaler.transform(input_df[features])
-    return -model.decision_function(X)[0]
-
-# 🔥 FIXED uncertainty (real ensemble)
-def get_ensemble_scores(input_df):
+def get_ensemble_scores(df_row, n=10):
     scores = []
-    for i in range(7):
-        temp_model = joblib.load("model.pkl")  # simulate ensemble variation
-        X = scaler.transform(input_df[features])
-        scores.append(-temp_model.decision_function(X)[0] + np.random.normal(0, 0.01))
+    for _ in range(n):
+        noise = np.random.normal(0, 0.2, size=len(features))
+        temp = df_row.copy()
+        temp[features] += noise
+        score = compute_score(temp)
+        scores.append(score)
     return np.array(scores)
 
-# 🔥 FIXED confidence scaling
 def compute_confidence(std):
-    return np.exp(-5 * std)  # more realistic spread
+    return 1 / (1 + std)
 
-def generate_explanation(row, cf_df, confidence):
-    top_feature = cf_df.iloc[0]["feature"]
-    original_val = cf_df.iloc[0]["original"]
-    new_val = cf_df.iloc[0]["counterfactual"]
-
-    return f"""
-### 🔍 Anomaly Type: {row['anomaly_type'].upper()}
-
-**Root Cause:**  
-'{top_feature}' is driving the anomaly.
-
-**Fix Recommendation:**  
-Change `{top_feature}` from **{round(original_val,2)} → {round(new_val,2)}**
-
-**Confidence:** {round(confidence*100,2)}%
-"""
+def generate_features(df):
+    if "lag_1" not in df.columns:
+        df["lag_1"] = df["value"].shift(1)
+        df["lag_2"] = df["value"].shift(2)
+        df["rolling_mean"] = df["value"].rolling(5).mean()
+        df["rolling_std"] = df["value"].rolling(5).std()
+        df = df.fillna(method="bfill")
+    return df
 
 # -------------------------
-# TITLE
+# UI HEADER
 # -------------------------
-st.title("🧠 CAUSAL-XAD Dashboard")
+st.title("CAUSAL-XAD Dashboard")
 
-# -------------------------
-# FILE UPLOAD
-# -------------------------
-uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
+uploaded = st.file_uploader("Upload CSV")
 
-if uploaded_file:
-    df = pd.read_csv(uploaded_file)
+if uploaded:
+    df = pd.read_csv(uploaded)
 else:
     df = pd.read_csv("data.csv")
 
-# -------------------------
-# VALIDATION
-# -------------------------
-missing = [f for f in features if f not in df.columns]
-
-if missing:
-    st.error(f"Missing features: {missing}")
-    st.stop()
+df = generate_features(df)
 
 # -------------------------
-# COMPUTE SCORES
+# MODEL PREDICTION
 # -------------------------
-X_scaled = scaler.transform(df[features])
-df["score"] = -model.decision_function(X_scaled)
-df["pred"] = df["score"].apply(lambda x: 1 if x > 0 else 0)
+X = scaler.transform(df[features])
+df["score"] = model.decision_function(X)
+df["pred"] = (df["score"] > 0).astype(int)
 
 # -------------------------
-# CREATE 6 TABS
+# TABS
 # -------------------------
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "📊 Overview",
-    "📈 Trends",
-    "🚨 Detection",
-    "🧠 Explanation",
-    "🔬 Feature Impact",
-    "📉 Uncertainty"
+tabs = st.tabs([
+    "Overview",
+    "Trends",
+    "Detection",
+    "Explanation",
+    "Feature Impact",
+    "Confidence",
+    "Simulator"
 ])
 
 # =========================
 # TAB 1: OVERVIEW
 # =========================
-with tab1:
-    st.subheader("Dataset Preview")
-    st.dataframe(df.head())
+with tabs[0]:
+    st.subheader("Dataset Overview")
 
-    st.metric("Total Rows", len(df))
-    st.metric("Anomalies", df["pred"].sum())
+    col1, col2 = st.columns(2)
+
+    col1.metric("Total Rows", len(df))
+    col2.metric("Anomalies", df["pred"].sum())
+
+    st.dataframe(df.head(20))
 
 # =========================
 # TAB 2: TRENDS
 # =========================
-with tab2:
+with tabs[1]:
     st.subheader("Time Series Trend")
 
     fig, ax = plt.subplots(figsize=(8,3))
     ax.plot(df["value"])
-    ax.set_title("Value Trend")
+    ax.set_title("Value over Time")
     st.pyplot(fig)
+
+    st.info("Shows overall behavior of the signal. Look for sudden jumps or gradual shifts.")
 
 # =========================
 # TAB 3: DETECTION
 # =========================
-with tab3:
-    st.subheader("Anomaly Detection")
+with tabs[2]:
+    st.subheader("Detected Anomalies")
 
     fig, ax = plt.subplots(figsize=(8,3))
     ax.plot(df["value"], label="Value")
@@ -136,94 +118,127 @@ with tab3:
     ax.legend()
     st.pyplot(fig)
 
+    st.info("Points marked are detected anomalies.")
+
 # =========================
 # TAB 4: EXPLANATION
 # =========================
-with tab4:
+with tabs[3]:
     st.subheader("Causal Explanation")
 
     anomaly_indices = df[df["pred"] == 1].index.tolist()
 
     if anomaly_indices:
-        selected = st.selectbox("Select anomaly index", anomaly_indices)
+        idx = st.selectbox("Select anomaly index", anomaly_indices)
 
-        point = df.loc[[selected]].copy()
-        baseline_score = compute_score(point)
+        point = df.loc[[idx]].copy()
+        baseline = compute_score(point)
 
-        results = []
+        impacts = []
 
-        for feature in features:
-            test_point = point.copy()
-            median_val = df[feature].median()
-            test_point[feature] = median_val
+        for f in features:
+            temp = point.copy()
+            temp[f] = df[f].median()
+            new_score = compute_score(temp)
 
-            new_score = compute_score(test_point)
-
-            results.append({
-                "feature": feature,
-                "original": point.iloc[0][feature],
-                "counterfactual": median_val,
-                "impact": baseline_score - new_score
+            impacts.append({
+                "feature": f,
+                "impact": baseline - new_score
             })
 
-        cf_df = pd.DataFrame(results).sort_values(by="impact", ascending=False)
+        cf_df = pd.DataFrame(impacts).sort_values("impact", ascending=False)
 
-        scores = get_ensemble_scores(point)
-        confidence = compute_confidence(scores.std())
+        top = cf_df.iloc[0]
 
-        st.markdown(generate_explanation(df.loc[selected], cf_df, confidence))
+        st.write("Anomaly Type: Detected")
+        st.write(f"Root Cause: {top['feature']}")
 
-    else:
-        st.warning("No anomalies detected")
+        st.write(f"Suggested Fix: Adjust {top['feature']} to normal range")
 
 # =========================
 # TAB 5: FEATURE IMPACT
 # =========================
-with tab5:
-    st.subheader("Feature Importance")
+with tabs[4]:
+    st.subheader("Feature Impact")
 
     if anomaly_indices:
-        selected = anomaly_indices[0]
-        point = df.loc[[selected]]
-
-        baseline_score = compute_score(point)
+        idx = anomaly_indices[0]
+        point = df.loc[[idx]]
 
         impacts = []
 
-        for feature in features:
-            test_point = point.copy()
-            test_point[feature] = df[feature].median()
+        for f in features:
+            temp = point.copy()
+            temp[f] = df[f].median()
+            new_score = compute_score(temp)
 
-            new_score = compute_score(test_point)
+            impacts.append({
+                "feature": f,
+                "impact": compute_score(point) - new_score
+            })
 
-            impacts.append((feature, baseline_score - new_score))
+        cf_df = pd.DataFrame(impacts)
 
-        imp_df = pd.DataFrame(impacts, columns=["feature", "impact"])
-
-        fig, ax = plt.subplots(figsize=(8,3))
-        ax.bar(imp_df["feature"], imp_df["impact"])
-        plt.xticks(rotation=30)
+        fig, ax = plt.subplots(figsize=(6,3))
+        ax.bar(cf_df["feature"], cf_df["impact"])
         st.pyplot(fig)
 
+        st.info("Higher impact means stronger contribution to anomaly.")
+
 # =========================
-# TAB 6: UNCERTAINTY
+# TAB 6: CONFIDENCE
 # =========================
-with tab6:
-    st.subheader("Model Uncertainty")
+with tabs[5]:
+    st.subheader("Model Confidence")
 
     if anomaly_indices:
-        selected = anomaly_indices[0]
-        point = df.loc[[selected]]
+        idx = anomaly_indices[0]
+        point = df.loc[[idx]]
 
         scores = get_ensemble_scores(point)
-
-        fig, ax = plt.subplots(figsize=(8,3))
-        ax.hist(scores, bins=8)
-        ax.set_title("Model Disagreement")
-        st.pyplot(fig)
 
         std = scores.std()
         confidence = compute_confidence(std)
 
-        st.write("Std Dev:", round(std,4))
-        st.write("Confidence:", round(confidence,4))
+        col1, col2 = st.columns(2)
+
+        with col1:
+            fig, ax = plt.subplots(figsize=(5,3))
+            ax.hist(scores, bins=8)
+            st.pyplot(fig)
+
+        with col2:
+            st.metric("Uncertainty (std)", round(std,4))
+            st.metric("Confidence", f"{round(confidence*100,2)}%")
+
+            if confidence > 0.85:
+                st.success("High confidence")
+            elif confidence > 0.6:
+                st.warning("Moderate confidence")
+            else:
+                st.error("Low confidence")
+
+# =========================
+# TAB 7: SIMULATOR (NEW)
+# =========================
+with tabs[6]:
+    st.subheader("What-If Simulator")
+
+    if anomaly_indices:
+        idx = anomaly_indices[0]
+        point = df.loc[[idx]].copy()
+
+        st.write("Adjust feature values:")
+
+        for f in features:
+            val = float(point[f])
+            point[f] = st.slider(f, val-20, val+20, val)
+
+        new_score = compute_score(point)
+
+        st.metric("New Score", round(new_score,4))
+
+        if new_score < 0:
+            st.success("Anomaly reduced")
+        else:
+            st.error("Still anomalous")
