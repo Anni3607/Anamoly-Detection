@@ -4,236 +4,245 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pickle
 import json
+import os
 
 st.set_page_config(layout="wide")
 
-# -------------------------
-# LOAD MODEL
-# -------------------------
-model = pickle.load(open("model.pkl", "rb"))
-scaler = pickle.load(open("scaler.pkl", "rb"))
-features = json.load(open("features.json"))
+# =========================
+# SAFE MODEL LOADING
+# =========================
 
-# -------------------------
-# FUNCTIONS
-# -------------------------
-def compute_score(df_row):
-    X = scaler.transform(df_row[features])
-    return model.decision_function(X)[0]
+def load_pickle(path, name):
+    if not os.path.exists(path):
+        st.error(f"{name} not found")
+        st.stop()
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception as e:
+        st.error(f"Error loading {name}: {e}")
+        st.stop()
 
-def compute_confidence(scores):
-    std = np.std(scores)
-    return 1 / (1 + std)
+model = load_pickle("model.pkl", "model.pkl")
+scaler = load_pickle("scaler.pkl", "scaler.pkl")
 
-def get_ensemble_scores(df_row, n=10):
-    scores = []
-    for _ in range(n):
-        noise = np.random.normal(0, 0.2, len(features))
-        temp = df_row.copy()
-        temp[features] += noise
-        scores.append(compute_score(temp))
-    return np.array(scores)
+if not os.path.exists("features.json"):
+    st.error("features.json not found")
+    st.stop()
 
-def generate_features(df):
-    df["lag_1"] = df["value"].shift(1)
-    df["lag_2"] = df["value"].shift(2)
-    df["rolling_mean"] = df["value"].rolling(5).mean()
-    df["rolling_std"] = df["value"].rolling(5).std()
-    df = df.fillna(method="bfill")
-    return df
+with open("features.json") as f:
+    feature_cols = json.load(f)
 
-# -------------------------
-# UI
-# -------------------------
+# =========================
+# TITLE
+# =========================
+
 st.title("CAUSAL-XAD Dashboard")
 
-uploaded = st.file_uploader("Upload CSV")
+# =========================
+# FILE UPLOAD
+# =========================
 
-if uploaded:
-    df = pd.read_csv(uploaded)
-else:
-    df = pd.read_csv("data.csv")
+uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 
-df = generate_features(df)
+if uploaded_file is None:
+    st.info("Upload a CSV file to begin")
+    st.stop()
 
-# -------------------------
+df = pd.read_csv(uploaded_file)
+
+# =========================
+# FEATURE ENGINEERING
+# =========================
+
+df["lag_1"] = df["value"].shift(1)
+df["lag_2"] = df["value"].shift(2)
+df["rolling_mean"] = df["value"].rolling(5).mean()
+df["rolling_std"] = df["value"].rolling(5).std()
+df = df.fillna(method="bfill")
+
+# =========================
 # MODEL PREDICTION
-# -------------------------
-X = scaler.transform(df[features])
-df["score"] = model.decision_function(X)
+# =========================
 
-threshold = np.percentile(df["score"], 10)
-df["pred"] = (df["score"] < threshold).astype(int)
+X = df[feature_cols]
+X_scaled = scaler.transform(X)
 
-anomalies = df[df["pred"] == 1]
-anomaly_indices = anomalies.index.tolist()
-
-# -------------------------
-# TABS (8)
-# -------------------------
-tabs = st.tabs([
-    "Overview",
-    "Data",
-    "Trends",
-    "Detection",
-    "Anomaly Types",
-    "Explanation",
-    "Feature Impact",
-    "Confidence"
-])
+df["score"] = model.decision_function(X_scaled)
+df["pred"] = model.predict(X_scaled)
+df["pred"] = df["pred"].map({1: 0, -1: 1})
 
 # =========================
-# 1. OVERVIEW
+# SIMPLE ANOMALY TYPE
 # =========================
-with tabs[0]:
-    st.subheader("Overview")
-    st.write("Basic dataset statistics and anomaly count.")
 
-    col1, col2 = st.columns(2)
-    col1.metric("Total Rows", len(df))
-    col2.metric("Anomalies", len(anomalies))
+df["diff"] = df["value"].diff().fillna(0)
 
-# =========================
-# 2. DATA
-# =========================
-with tabs[1]:
-    st.subheader("Dataset Preview")
-    st.write("Shows first rows of processed dataset.")
+threshold = df["diff"].std() * 2
 
-    st.dataframe(df.head(20))
+df["anomaly_type"] = "normal"
 
-# =========================
-# 3. TRENDS
-# =========================
-with tabs[2]:
-    st.subheader("Trend")
-    st.write("Displays overall pattern of the time series.")
-
-    fig, ax = plt.subplots(figsize=(6,3))
-    ax.plot(df["value"])
-    st.pyplot(fig)
-
-# =========================
-# 4. DETECTION
-# =========================
-with tabs[3]:
-    st.subheader("Anomaly Detection")
-    st.write("Detected anomalies highlighted in red.")
-
-    fig, ax = plt.subplots(figsize=(6,3))
-    ax.plot(df["value"])
-
-    ax.scatter(anomalies.index, anomalies["value"], color="red", s=25)
-
-    st.pyplot(fig)
-
-# =========================
-# 5. ANOMALY TYPES
-# =========================
-with tabs[4]:
-    st.subheader("Anomaly Types")
-    st.write("Classifies anomalies into spike or drift.")
-
-    df["diff"] = df["value"].diff().fillna(0)
-    df["anomaly_type"] = "normal"
-
-    for i in anomaly_indices:
-        if abs(df.loc[i, "diff"]) > df["diff"].std()*2:
+for i in range(len(df)):
+    if df.loc[i, "pred"] == 1:
+        if abs(df.loc[i, "diff"]) > threshold:
             df.loc[i, "anomaly_type"] = "spike"
         else:
             df.loc[i, "anomaly_type"] = "drift"
 
-    fig, ax = plt.subplots(figsize=(6,3))
+# =========================
+# TABS
+# =========================
+
+tabs = st.tabs([
+    "Overview",
+    "Trend",
+    "Detection",
+    "Anomaly Types",
+    "Explanation",
+    "Feature Impact",
+    "Confidence",
+    "What-if Simulator"
+])
+
+# =========================
+# TAB 1: OVERVIEW
+# =========================
+
+with tabs[0]:
+    st.subheader("Dataset Overview")
+    st.caption("Basic dataset preview and anomaly count")
+
+    st.dataframe(df.head(20), use_container_width=True)
+
+    col1, col2 = st.columns(2)
+    col1.metric("Total Rows", len(df))
+    col2.metric("Detected Anomalies", int(df["pred"].sum()))
+
+# =========================
+# TAB 2: TREND
+# =========================
+
+with tabs[1]:
+    st.subheader("Time Series Trend")
+    st.caption("Overall behavior of the signal")
+
+    fig, ax = plt.subplots(figsize=(8,3))
+    ax.plot(df["value"])
+    st.pyplot(fig)
+
+# =========================
+# TAB 3: DETECTION
+# =========================
+
+with tabs[2]:
+    st.subheader("Detected Anomalies")
+    st.caption("Points flagged as anomalies")
+
+    fig, ax = plt.subplots(figsize=(8,3))
+    ax.plot(df["value"])
+    anomalies = df[df["pred"] == 1]
+    ax.scatter(anomalies.index, anomalies["value"])
+    st.pyplot(fig)
+
+# =========================
+# TAB 4: ANOMALY TYPES
+# =========================
+
+with tabs[3]:
+    st.subheader("Anomaly Types")
+    st.caption("Simple classification into spike or drift")
+
+    fig, ax = plt.subplots(figsize=(8,3))
     ax.plot(df["value"])
 
-    for t, c in [("spike","red"),("drift","orange")]:
+    for t in ["spike", "drift"]:
         subset = df[df["anomaly_type"] == t]
-        ax.scatter(subset.index, subset["value"], color=c, s=25, label=t)
+        ax.scatter(subset.index, subset["value"], label=t)
 
     ax.legend()
     st.pyplot(fig)
 
 # =========================
-# 6. EXPLANATION
+# TAB 5: EXPLANATION
 # =========================
-with tabs[5]:
+
+with tabs[4]:
     st.subheader("Explanation")
-    st.write("Shows which feature contributes most to anomaly.")
+    st.caption("Top contributing feature for anomaly")
 
-    if anomaly_indices:
-        idx = st.selectbox("Select anomaly", anomaly_indices)
+    idx = st.number_input("Select index", 0, len(df)-1, 0)
 
-        point = df.loc[[idx]]
-        baseline = compute_score(point)
+    row = df.loc[idx]
 
-        impacts = []
+    contributions = {}
+    for col in feature_cols:
+        contributions[col] = abs(row[col] - df[col].median())
 
-        for f in features:
-            temp = point.copy()
-            temp[f] = df[f].median()
-            new_score = compute_score(temp)
+    top_feature = max(contributions, key=contributions.get)
 
-            impacts.append({
-                "feature": f,
-                "impact": baseline - new_score
-            })
-
-        cf_df = pd.DataFrame(impacts).sort_values("impact", ascending=False)
-
-        top = cf_df.iloc[0]
-
-        st.write(f"Root Cause: {top['feature']}")
-        st.write("Adjusting this feature reduces anomaly.")
+    st.write("Anomaly Type:", row["anomaly_type"])
+    st.write("Top Feature:", top_feature)
 
 # =========================
-# 7. FEATURE IMPACT
+# TAB 6: FEATURE IMPACT
 # =========================
-with tabs[6]:
+
+with tabs[5]:
     st.subheader("Feature Impact")
-    st.write("Relative importance of features in anomaly.")
+    st.caption("Relative deviation of features")
 
-    if anomaly_indices:
-        idx = anomaly_indices[0]
-        point = df.loc[[idx]]
+    idx = st.number_input("Index", 0, len(df)-1, 0, key="impact")
 
-        impacts = []
+    row = df.loc[idx]
 
-        for f in features:
-            temp = point.copy()
-            temp[f] = df[f].median()
-            new_score = compute_score(temp)
+    impacts = [abs(row[c] - df[c].median()) for c in feature_cols]
 
-            impacts.append({
-                "feature": f,
-                "impact": compute_score(point) - new_score
-            })
-
-        cf_df = pd.DataFrame(impacts)
-
-        fig, ax = plt.subplots(figsize=(5,3))
-        ax.bar(cf_df["feature"], cf_df["impact"])
-        st.pyplot(fig)
+    fig, ax = plt.subplots(figsize=(8,3))
+    ax.bar(feature_cols, impacts)
+    plt.xticks(rotation=30)
+    st.pyplot(fig)
 
 # =========================
-# 8. CONFIDENCE
+# TAB 7: CONFIDENCE
 # =========================
-with tabs[7]:
+
+with tabs[6]:
     st.subheader("Confidence")
-    st.write("Model reliability based on prediction stability.")
+    st.caption("Model certainty using score distribution")
 
-    if anomaly_indices:
-        idx = anomaly_indices[0]
-        point = df.loc[[idx]]
+    scores = df["score"]
+    confidence = 1 / (1 + scores.std())
 
-        scores = get_ensemble_scores(point)
-        confidence = compute_confidence(scores)
+    st.metric("Confidence", f"{confidence*100:.2f}%")
 
-        col1, col2 = st.columns(2)
+    fig, ax = plt.subplots(figsize=(8,3))
+    ax.hist(scores, bins=20)
+    st.pyplot(fig)
 
-        with col1:
-            fig, ax = plt.subplots(figsize=(5,3))
-            ax.hist(scores, bins=8)
-            st.pyplot(fig)
+# =========================
+# TAB 8: WHAT-IF SIMULATOR
+# =========================
 
-        with col2:
-            st.metric("Confidence", f"{round(confidence*100,2)}%")
+with tabs[7]:
+    st.subheader("What-if Simulator")
+    st.caption("Modify inputs and see score change")
+
+    idx = st.number_input("Index", 0, len(df)-1, 0, key="sim")
+
+    test_point = df.loc[[idx]].copy()
+
+    for col in feature_cols:
+        test_point[col] = st.slider(col,
+                                   float(df[col].min()),
+                                   float(df[col].max()),
+                                   float(test_point[col]))
+
+    scaled = scaler.transform(test_point[feature_cols])
+    new_score = model.decision_function(scaled)[0]
+
+    st.metric("New Score", round(new_score, 4))
+
+    if new_score > 0:
+        st.success("Normal")
+    else:
+        st.error("Anomalous")
