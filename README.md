@@ -1,5 +1,7 @@
 CAUSAL-XAD: Causal, Uncertainty-Aware, Explainable Anomaly Detection
 
+https://anamoly-detection-6eznykyqmvm5bfwl8futtj.streamlit.app/
+
 This project implements an end-to-end anomaly detection system that goes beyond simple detection and focuses on understanding why anomalies occur and how to fix them.
 
 Instead of just labeling data points as anomalous, the system provides causal-style explanations, confidence estimates, and actionable recommendations. It is designed to be practical, interpretable, and suitable for real-world usage.
